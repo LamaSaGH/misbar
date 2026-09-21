@@ -29,6 +29,41 @@ def save_check_run(
 
     return str(inserted.inserted_id)
 
+def save_generic_check_run(
+    *,
+    monitoring_check_id: str,
+    check_name: str,
+    group: str,
+    tags: list[str],
+    status: str,
+    source: str,
+    function_name: str,
+    request: dict[str, Any],
+    result: dict[str, Any],
+) -> str:
+    document = {
+        "platform": group,
+        "check_type": "generic_api",
+        "monitoring_check_id": monitoring_check_id,
+        "check_name": check_name,
+        "group": group,
+        "tags": tags,
+        "status": status,
+        "source": source,
+        "function_name": function_name,
+        "request": request,
+        "result": result,
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    database = get_database()
+
+    inserted = database["check_runs"].insert_one(
+        document
+    )
+
+    return str(inserted.inserted_id)
+
 
 def get_check_run(run_id: str) -> dict[str, Any] | None:
     database = get_database()

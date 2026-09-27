@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sewar-monitor"
+name = "misbar"
 version = "0.1.0"
-description = "Internal testing and monitoring platform for Sewar"
+description = "Reusable API monitoring and validation platform"
 requires-python = ">=3.10"
 dependencies = [
     "requests==2.34.2",

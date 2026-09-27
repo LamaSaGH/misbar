@@ -9,114 +9,74 @@ from web_api.app import app
 client = TestClient(app)
 
 
-def test_function_definitions_are_returned():
+def test_function_catalog_contains_all_functions():
     definitions = (
         list_check_function_definitions()
     )
 
-    names = {
+    function_names = {
         definition["name"]
         for definition in definitions
     }
 
-    assert "status_code_200" in names
+    assert function_names == {
+        "expected_status_code",
+        "json_field_equals",
+        "json_field_exists",
+        "json_list_not_empty",
+        "response_contains_text",
+        "response_header_exists",
+        "status_code_200",
+    }
 
-    assert (
-        "expected_status_code"
-        in names
+
+def test_each_function_has_catalog_metadata():
+    definitions = (
+        list_check_function_definitions()
     )
 
     for definition in definitions:
-        assert (
-            definition["registered"]
-            is True
+        assert definition["name"]
+        assert definition["display_name"]
+        assert definition["description"]
+        assert definition["response_type"]
+        assert isinstance(
+            definition["parameters"],
+            list,
         )
-
-        assert (
-            "display_name"
-            in definition
-        )
-
-        assert (
-            "description"
-            in definition
-        )
-
-        assert (
-            "parameters"
-            in definition
-        )
+        assert definition["registered"] is True
 
 
-def test_function_catalog_api():
+def test_check_functions_api_returns_catalog():
     response = client.get(
         "/api/check-functions"
     )
 
     assert response.status_code == 200
 
-    data = response.json()
+    body = response.json()
 
-    assert data["count"] == 2
-
-    assert len(
-        data["functions"]
-    ) == 2
-
-    function_names = {
-        function["name"]
-        for function in data["functions"]
-    }
-
-    assert function_names == {
-        "status_code_200",
-        "expected_status_code",
-    }
+    assert body["count"] == 7
+    assert len(body["functions"]) == 7
 
 
-def test_status_code_200_has_no_parameters():
+def test_json_field_equals_metadata():
     definitions = (
         list_check_function_definitions()
     )
 
-    function = next(
-        definition
-        for definition in definitions
-        if definition["name"]
-        == "status_code_200"
-    )
-
-    assert function["parameters"] == []
-
-
-def test_expected_status_code_metadata():
-    response = client.get(
-        "/api/check-functions"
-    )
-
-    functions = response.json()[
-        "functions"
-    ]
-
-    function = next(
+    definition = next(
         item
-        for item in functions
-        if item["name"]
-        == "expected_status_code"
+        for item in definitions
+        if item["name"] == "json_field_equals"
     )
 
-    parameters = function["parameters"]
+    parameter_names = {
+        parameter["name"]
+        for parameter in definition["parameters"]
+    }
 
-    assert len(parameters) == 1
-
-    parameter = parameters[0]
-
-    assert parameter["name"] == (
-        "expected_status_code"
-    )
-
-    assert parameter["type"] == "integer"
-
-    assert parameter["required"] is True
-
-    assert parameter["example"] == 200
+    assert parameter_names == {
+        "json_path",
+        "expected_value",
+    }

@@ -6,26 +6,32 @@ import requests
 from check_functions.registry import (
     run_registered_function,
 )
-from storage.check_runs import save_generic_check_run
+from storage.check_runs import (
+    save_generic_check_run,
+)
 from storage.monitoring_checks import (
     get_monitoring_check,
     record_monitoring_check_run,
 )
-
-
-MAX_RESPONSE_PREVIEW_LENGTH = 10_000
+from validation.rule_engine import (
+    evaluate_validation_rules,
+)
 
 
 def _build_response_snapshot(
     response: requests.Response,
     response_time_ms: int,
 ) -> dict[str, Any]:
+    """
+    Save response metadata without storing the complete
+    response body.
+    """
     content_type = response.headers.get(
         "content-type",
-        ""
+        "",
     )
 
-    response_snapshot: dict[str, Any] = {
+    return {
         "status_code": response.status_code,
         "response_time_ms": response_time_ms,
         "content_type": content_type,
@@ -34,16 +40,68 @@ def _build_response_snapshot(
         },
     }
 
-    try:
-        response_snapshot["json"] = response.json()
-    except ValueError:
-        response_snapshot["text_preview"] = (
-            response.text[
-                :MAX_RESPONSE_PREVIEW_LENGTH
-            ]
+
+def _run_check_validation(
+    *,
+    check: dict[str, Any],
+    response: requests.Response,
+    response_time_ms: int,
+) -> tuple[str, dict[str, Any]]:
+    """
+    Run no-code validation rules when available.
+
+    Older checks continue using registered functions.
+    """
+    validations = (
+        check.get("validations") or []
+    )
+
+    if (
+        check.get("validation_mode") == "rules"
+        or validations
+    ):
+        validation_result = (
+            evaluate_validation_rules(
+                response=response,
+                response_time_ms=response_time_ms,
+                validations=validations,
+                validation_logic=check.get(
+                    "validation_logic",
+                    "all",
+                ),
+            )
         )
 
-    return response_snapshot
+        return (
+            "rule_engine",
+            validation_result,
+        )
+
+    function_name = check.get(
+        "function_name"
+    )
+
+    if not function_name:
+        raise ValueError(
+            "The monitoring check has no validation "
+            "function or validation rules."
+        )
+
+    validation_result = (
+        run_registered_function(
+            function_name=function_name,
+            response=response,
+            parameters=check.get(
+                "function_parameters",
+                {},
+            ),
+        )
+    )
+
+    return (
+        function_name,
+        validation_result,
+    )
 
 
 def run_generic_monitoring_check(
@@ -51,7 +109,9 @@ def run_generic_monitoring_check(
     *,
     source: str = "manual",
 ) -> dict[str, Any]:
-    check = get_monitoring_check(check_id)
+    check = get_monitoring_check(
+        check_id
+    )
 
     if check is None:
         raise ValueError(
@@ -63,34 +123,50 @@ def run_generic_monitoring_check(
             "Monitoring check is not active."
         )
 
-    request_configuration = check["request"]
-    function_name = check["function_name"]
+    request_configuration = check[
+        "request"
+    ]
 
     request_snapshot = {
-        "method": request_configuration["method"],
+        "method": request_configuration[
+            "method"
+        ],
         "url": request_configuration["url"],
         "headers": request_configuration.get(
             "headers",
             {},
         ),
-        "query_parameters": request_configuration.get(
-            "query_parameters",
-            {},
+        "query_parameters": (
+            request_configuration.get(
+                "query_parameters",
+                {},
+            )
         ),
-        "body": request_configuration.get("body"),
-        "timeout_seconds": request_configuration.get(
-            "timeout_seconds",
-            15,
+        "body": request_configuration.get(
+            "body"
+        ),
+        "timeout_seconds": (
+            request_configuration.get(
+                "timeout_seconds",
+                15,
+            )
         ),
     }
 
     started_at = perf_counter()
 
     try:
-        request_arguments: dict[str, Any] = {
-            "method": request_snapshot["method"],
+        request_arguments: dict[
+            str,
+            Any,
+        ] = {
+            "method": request_snapshot[
+                "method"
+            ],
             "url": request_snapshot["url"],
-            "headers": request_snapshot["headers"],
+            "headers": request_snapshot[
+                "headers"
+            ],
             "params": request_snapshot[
                 "query_parameters"
             ],
@@ -99,7 +175,10 @@ def run_generic_monitoring_check(
             ],
         }
 
-        if request_snapshot["body"] is not None:
+        if (
+            request_snapshot["body"]
+            is not None
+        ):
             request_arguments["json"] = (
                 request_snapshot["body"]
             )
@@ -109,35 +188,57 @@ def run_generic_monitoring_check(
         )
 
         response_time_ms = round(
-            (perf_counter() - started_at) * 1000
+            (
+                perf_counter()
+                - started_at
+            )
+            * 1000
         )
 
-        validation = run_registered_function(
-            function_name=function_name,
+        (
+            validation_name,
+            validation_result,
+        ) = _run_check_validation(
+            check=check,
             response=response,
-            parameters=check.get(
-                "function_parameters",
-                {},
+            response_time_ms=(
+                response_time_ms
             ),
         )
 
         status = (
             "passed"
-            if validation.get("passed") is True
+            if validation_result.get(
+                "passed"
+            )
+            is True
             else "failed"
         )
 
         result = {
-            "response": _build_response_snapshot(
-                response,
-                response_time_ms,
+            "response": (
+                _build_response_snapshot(
+                    response,
+                    response_time_ms,
+                )
             ),
-            "validation": validation,
+            "validation": (
+                validation_result
+            ),
         }
 
     except requests.RequestException as error:
         response_time_ms = round(
-            (perf_counter() - started_at) * 1000
+            (
+                perf_counter()
+                - started_at
+            )
+            * 1000
+        )
+
+        validation_name = (
+            check.get("function_name")
+            or "rule_engine"
         )
 
         status = "error"
@@ -146,13 +247,20 @@ def run_generic_monitoring_check(
             "response": None,
             "validation": {
                 "passed": False,
-                "function_name": function_name,
+                "validation_type": (
+                    check.get(
+                        "validation_mode",
+                        "function",
+                    )
+                ),
                 "message": (
                     f"{type(error).__name__}: "
                     f"{error}"
                 ),
             },
-            "response_time_ms": response_time_ms,
+            "response_time_ms": (
+                response_time_ms
+            ),
         }
 
     run_id = save_generic_check_run(
@@ -162,7 +270,7 @@ def run_generic_monitoring_check(
         tags=check.get("tags") or [],
         status=status,
         source=source,
-        function_name=function_name,
+        function_name=validation_name,
         request=request_snapshot,
         result=result,
     )
@@ -179,6 +287,12 @@ def run_generic_monitoring_check(
         "name": check["name"],
         "group": check["group"],
         "status": status,
-        "function_name": function_name,
+        "validation_mode": check.get(
+            "validation_mode",
+            "function",
+        ),
+        # Retained for compatibility with existing
+        # checks, tests, and API clients.
+        "function_name": validation_name,
         "result": result,
     }

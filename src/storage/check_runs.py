@@ -65,11 +65,18 @@ def save_generic_check_run(
     return str(inserted.inserted_id)
 
 
-def get_check_run(run_id: str) -> dict[str, Any] | None:
+def get_check_run(
+    run_id: str,
+) -> dict[str, Any] | None:
+    if not ObjectId.is_valid(run_id):
+        return None
+
     database = get_database()
 
     document = database["check_runs"].find_one(
-        {"_id": ObjectId(run_id)}
+        {
+            "_id": ObjectId(run_id),
+        }
     )
 
     if document is None:
@@ -106,3 +113,21 @@ def list_check_runs(
         documents.append(document)
 
     return documents
+
+def monitoring_check_has_runs(
+    monitoring_check_id: str,
+) -> bool:
+    database = get_database()
+
+    document = database["check_runs"].find_one(
+        {
+            "monitoring_check_id": (
+                monitoring_check_id
+            ),
+        },
+        {
+            "_id": 1,
+        },
+    )
+
+    return document is not None

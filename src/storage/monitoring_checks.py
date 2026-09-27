@@ -4,7 +4,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 from bson import ObjectId
-
+from validation.rule_engine import (
+    validate_validation_rules,
+)
 from check_functions.registry import get_check_function
 from storage.mongodb import get_database
 
@@ -77,13 +79,15 @@ def create_monitoring_check(
     group: str,
     request_url: str,
     request_method: str,
-    function_name: str,
+    function_name: str | None = None,
     tags: list[str] | None = None,
     request_headers: dict[str, str] | None = None,
     query_parameters: dict[str, Any] | None = None,
     request_body: Any = None,
     timeout_seconds: int = 15,
     function_parameters: dict[str, Any] | None = None,
+    validations: list[dict[str, Any]] | None = None,
+    validation_logic: str = "all",
     schedule_enabled: bool = False,
     frequency: str | None = None,
     run_time: str | None = None,
@@ -92,7 +96,6 @@ def create_monitoring_check(
     normalized_name = name.strip()
     normalized_group = group.strip()
     normalized_method = request_method.strip().upper()
-    normalized_function_name = function_name.strip()
     normalized_timezone_name = timezone_name.strip()
 
     if not normalized_name:
@@ -120,9 +123,42 @@ def create_monitoring_check(
             "timeout_seconds must be between 1 and 120."
         )
 
-    get_check_function(
-        normalized_function_name
-    )
+    configured_validations = validations or []
+
+    if configured_validations:
+        validation_mode = "rules"
+
+        validate_validation_rules(
+            validations=configured_validations,
+            validation_logic=validation_logic,
+        )
+
+        normalized_function_name = None
+        normalized_function_parameters = {}
+
+    else:
+        validation_mode = "function"
+
+        if (
+            function_name is None
+            or not function_name.strip()
+        ):
+            raise ValueError(
+                "A function name or validation rules "
+                "are required."
+            )
+
+        normalized_function_name = (
+            function_name.strip()
+        )
+
+        get_check_function(
+            normalized_function_name
+        )
+
+        normalized_function_parameters = (
+            function_parameters or {}
+        )
 
     if schedule_enabled:
         if frequency not in ALLOWED_FREQUENCIES:
@@ -168,9 +204,12 @@ def create_monitoring_check(
             "body": request_body,
             "timeout_seconds": timeout_seconds,
         },
+        "validation_mode": validation_mode,
+        "validations": configured_validations,
+        "validation_logic": validation_logic,
         "function_name": normalized_function_name,
         "function_parameters": (
-            function_parameters or {}
+            normalized_function_parameters
         ),
         "schedule": {
             "enabled": schedule_enabled,
@@ -564,3 +603,30 @@ def complete_monitoring_check_schedule(
     )
 
     return result.matched_count == 1
+
+def delete_archived_monitoring_check(
+    check_id: str,
+) -> bool:
+    """
+    Delete an archived check that has never been run.
+
+    The status and last-run conditions prevent active or
+    previously executed checks from being deleted.
+    """
+    if not ObjectId.is_valid(check_id):
+        return False
+
+    database = get_database()
+
+    result = database[
+        "monitoring_checks"
+    ].delete_one(
+        {
+            "_id": ObjectId(check_id),
+            "status": "archived",
+            "last_run_at": None,
+            "last_run_id": None,
+        }
+    )
+
+    return result.deleted_count == 1

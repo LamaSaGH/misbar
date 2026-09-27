@@ -1,8 +1,15 @@
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+)
+from fastapi.responses import (
+    FileResponse,
+    Response,
+)
 from pydantic import BaseModel, Field
 
 from check_functions.registry import (
@@ -10,6 +17,11 @@ from check_functions.registry import (
 )
 from services.generic_check_service import (
     run_generic_monitoring_check,
+)
+from services.monitoring_check_management import (
+    MonitoringCheckDeletionConflictError,
+    MonitoringCheckNotFoundError,
+    delete_unused_monitoring_check,
 )
 from storage.check_runs import list_check_runs
 from storage.mongodb import ping_database
@@ -22,39 +34,41 @@ from storage.monitoring_checks import (
 
 
 app = FastAPI(
-    title="Platform Monitoring API",
+    title="Misbar Platform Monitoring API",
     description=(
         "Create, save, run, and schedule reusable "
         "monitoring checks for digital platforms."
     ),
-    version="0.2.0",
+    version="0.3.0",
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = (
+    Path(__file__).resolve().parents[2]
+)
 DASHBOARD_FILE = PROJECT_ROOT / "index.html"
 
 
 class MonitoringCheckCreateRequest(BaseModel):
     name: str = Field(
-        min_length=1
+        min_length=1,
     )
 
     group: str = Field(
-        min_length=1
+        min_length=1,
     )
 
     request_url: str = Field(
-        min_length=1
+        min_length=1,
     )
 
     request_method: str = "GET"
 
     request_headers: dict[str, str] = Field(
-        default_factory=dict
+        default_factory=dict,
     )
 
     query_parameters: dict[str, Any] = Field(
-        default_factory=dict
+        default_factory=dict,
     )
 
     request_body: Any = None
@@ -65,16 +79,23 @@ class MonitoringCheckCreateRequest(BaseModel):
         le=120,
     )
 
-    function_name: str = Field(
-        min_length=1
-    )
+    # Legacy registered-function validation.
+    # This remains optional for existing checks.
+    function_name: str | None = None
 
     function_parameters: dict[str, Any] = Field(
-        default_factory=dict
+        default_factory=dict,
     )
 
+    # New no-code validation rules.
+    validations: list[dict[str, Any]] = Field(
+        default_factory=list,
+    )
+
+    validation_logic: str = "all"
+
     tags: list[str] = Field(
-        default_factory=list
+        default_factory=list,
     )
 
     schedule_enabled: bool = False
@@ -93,7 +114,10 @@ class MonitoringCheckStatusRequest(BaseModel):
     status: str
 
 
-@app.get("/", include_in_schema=False)
+@app.get(
+    "/",
+    include_in_schema=False,
+)
 def dashboard():
     return FileResponse(
         DASHBOARD_FILE
@@ -206,13 +230,19 @@ def create_generic_monitoring_check(
             function_parameters=(
                 request.function_parameters
             ),
+            validations=request.validations,
+            validation_logic=(
+                request.validation_logic
+            ),
             tags=request.tags,
             schedule_enabled=(
                 request.schedule_enabled
             ),
             frequency=request.frequency,
             run_time=request.run_time,
-            timezone_name=request.timezone_name,
+            timezone_name=(
+                request.timezone_name
+            ),
         )
 
     except ValueError as error:
@@ -311,3 +341,34 @@ def run_monitoring_check_now(
                 "failed."
             ),
         ) from error
+
+
+@app.delete(
+    "/api/monitoring-checks/{check_id}",
+    status_code=204,
+)
+def delete_monitoring_check(
+    check_id: str,
+):
+    try:
+        delete_unused_monitoring_check(
+            check_id
+        )
+
+    except MonitoringCheckNotFoundError as error:
+        raise HTTPException(
+            status_code=404,
+            detail=str(error),
+        ) from error
+
+    except (
+        MonitoringCheckDeletionConflictError
+    ) as error:
+        raise HTTPException(
+            status_code=409,
+            detail=str(error),
+        ) from error
+
+    return Response(
+        status_code=204
+    )

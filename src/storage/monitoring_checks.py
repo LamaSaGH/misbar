@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -35,7 +35,9 @@ RUN_TIME_PATTERN = re.compile(
 )
 
 
-def _validate_request_url(request_url: str) -> str:
+def _validate_request_url(
+    request_url: str,
+) -> str:
     normalized_url = request_url.strip()
     parsed_url = urlparse(normalized_url)
 
@@ -62,6 +64,13 @@ def _normalize_tags(
     return sorted(normalized_tags)
 
 
+def _serialize_document(
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    document["_id"] = str(document["_id"])
+    return document
+
+
 def create_monitoring_check(
     *,
     name: str,
@@ -83,12 +92,18 @@ def create_monitoring_check(
     normalized_name = name.strip()
     normalized_group = group.strip()
     normalized_method = request_method.strip().upper()
+    normalized_function_name = function_name.strip()
+    normalized_timezone_name = timezone_name.strip()
 
     if not normalized_name:
-        raise ValueError("name must not be empty.")
+        raise ValueError(
+            "name must not be empty."
+        )
 
     if not normalized_group:
-        raise ValueError("group must not be empty.")
+        raise ValueError(
+            "group must not be empty."
+        )
 
     if normalized_method not in ALLOWED_METHODS:
         raise ValueError(
@@ -96,14 +111,18 @@ def create_monitoring_check(
             f"{normalized_method}"
         )
 
-    normalized_url = _validate_request_url(request_url)
+    normalized_url = _validate_request_url(
+        request_url
+    )
 
     if timeout_seconds < 1 or timeout_seconds > 120:
         raise ValueError(
             "timeout_seconds must be between 1 and 120."
         )
 
-    get_check_function(function_name)
+    get_check_function(
+        normalized_function_name
+    )
 
     if schedule_enabled:
         if frequency not in ALLOWED_FREQUENCIES:
@@ -114,12 +133,20 @@ def create_monitoring_check(
 
         if (
             run_time is None
-            or RUN_TIME_PATTERN.fullmatch(run_time) is None
+            or RUN_TIME_PATTERN.fullmatch(
+                run_time
+            ) is None
         ):
             raise ValueError(
                 "Scheduled checks require run_time in "
                 "HH:MM format."
             )
+
+        if not normalized_timezone_name:
+            raise ValueError(
+                "timezone_name must not be empty."
+            )
+
     else:
         frequency = None
         run_time = None
@@ -135,23 +162,28 @@ def create_monitoring_check(
             "method": normalized_method,
             "url": normalized_url,
             "headers": request_headers or {},
-            "query_parameters": query_parameters or {},
+            "query_parameters": (
+                query_parameters or {}
+            ),
             "body": request_body,
             "timeout_seconds": timeout_seconds,
         },
-        "function_name": function_name.strip(),
-        "function_parameters": function_parameters or {},
+        "function_name": normalized_function_name,
+        "function_parameters": (
+            function_parameters or {}
+        ),
         "schedule": {
             "enabled": schedule_enabled,
             "frequency": frequency,
             "run_time": run_time,
-            "timezone": timezone_name,
+            "timezone": normalized_timezone_name,
         },
         "status": "active",
         "last_run_at": None,
         "last_run_status": None,
         "last_run_id": None,
         "next_run_at": None,
+        "execution_claimed_until": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -184,8 +216,7 @@ def get_monitoring_check(
     if document is None:
         return None
 
-    document["_id"] = str(document["_id"])
-    return document
+    return _serialize_document(document)
 
 
 def list_monitoring_checks(
@@ -228,13 +259,10 @@ def list_monitoring_checks(
         .limit(limit)
     )
 
-    documents = []
-
-    for document in cursor:
-        document["_id"] = str(document["_id"])
-        documents.append(document)
-
-    return documents
+    return [
+        _serialize_document(document)
+        for document in cursor
+    ]
 
 
 def set_monitoring_check_status(
@@ -250,6 +278,19 @@ def set_monitoring_check_status(
     if not ObjectId.is_valid(check_id):
         return False
 
+    now = datetime.now(timezone.utc)
+
+    fields_to_set: dict[str, Any] = {
+        "status": status,
+        "updated_at": now,
+    }
+
+    if status in {"paused", "archived"}:
+        fields_to_set["next_run_at"] = None
+        fields_to_set[
+            "execution_claimed_until"
+        ] = None
+
     database = get_database()
 
     result = database[
@@ -259,10 +300,7 @@ def set_monitoring_check_status(
             "_id": ObjectId(check_id),
         },
         {
-            "$set": {
-                "status": status,
-                "updated_at": datetime.now(timezone.utc),
-            }
+            "$set": fields_to_set,
         },
     )
 
@@ -293,6 +331,234 @@ def record_monitoring_check_run(
                 "last_run_status": run_status,
                 "last_run_id": run_id,
                 "updated_at": now,
+            }
+        },
+    )
+
+    return result.matched_count == 1
+
+
+def list_uninitialized_scheduled_checks(
+    *,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """
+    Return active scheduled checks that do not yet have
+    a next execution time.
+    """
+    if limit < 1 or limit > 1_000:
+        raise ValueError(
+            "limit must be between 1 and 1000."
+        )
+
+    database = get_database()
+
+    cursor = (
+        database["monitoring_checks"]
+        .find(
+            {
+                "status": "active",
+                "schedule.enabled": True,
+                "next_run_at": None,
+            }
+        )
+        .sort("created_at", 1)
+        .limit(limit)
+    )
+
+    return [
+        _serialize_document(document)
+        for document in cursor
+    ]
+
+
+def initialize_monitoring_check_next_run(
+    *,
+    check_id: str,
+    next_run_at: datetime,
+) -> bool:
+    """
+    Save the first next_run_at value only when it has not
+    already been initialized by another scheduler process.
+    """
+    if not ObjectId.is_valid(check_id):
+        return False
+
+    if next_run_at.tzinfo is None:
+        raise ValueError(
+            "next_run_at must be timezone-aware."
+        )
+
+    now = datetime.now(timezone.utc)
+    database = get_database()
+
+    result = database[
+        "monitoring_checks"
+    ].update_one(
+        {
+            "_id": ObjectId(check_id),
+            "status": "active",
+            "schedule.enabled": True,
+            "next_run_at": None,
+        },
+        {
+            "$set": {
+                "next_run_at": next_run_at,
+                "updated_at": now,
+            }
+        },
+    )
+
+    return result.modified_count == 1
+
+
+def list_due_monitoring_checks(
+    *,
+    current_time: datetime,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """
+    Return scheduled checks whose next_run_at time has
+    arrived.
+    """
+    if current_time.tzinfo is None:
+        raise ValueError(
+            "current_time must be timezone-aware."
+        )
+
+    if limit < 1 or limit > 1_000:
+        raise ValueError(
+            "limit must be between 1 and 1000."
+        )
+
+    database = get_database()
+
+    cursor = (
+        database["monitoring_checks"]
+        .find(
+            {
+                "status": "active",
+                "schedule.enabled": True,
+                "next_run_at": {
+                    "$ne": None,
+                    "$lte": current_time,
+                },
+            }
+        )
+        .sort("next_run_at", 1)
+        .limit(limit)
+    )
+
+    return [
+        _serialize_document(document)
+        for document in cursor
+    ]
+
+
+def claim_due_monitoring_check(
+    *,
+    check_id: str,
+    current_time: datetime,
+    claim_minutes: int = 10,
+) -> bool:
+    """
+    Atomically claim a due check so two scheduler processes
+    cannot run the same check simultaneously.
+    """
+    if not ObjectId.is_valid(check_id):
+        return False
+
+    if current_time.tzinfo is None:
+        raise ValueError(
+            "current_time must be timezone-aware."
+        )
+
+    if claim_minutes < 1 or claim_minutes > 60:
+        raise ValueError(
+            "claim_minutes must be between 1 and 60."
+        )
+
+    claimed_until = (
+        current_time
+        + timedelta(minutes=claim_minutes)
+    )
+
+    database = get_database()
+
+    result = database[
+        "monitoring_checks"
+    ].update_one(
+        {
+            "_id": ObjectId(check_id),
+            "status": "active",
+            "schedule.enabled": True,
+            "next_run_at": {
+                "$ne": None,
+                "$lte": current_time,
+            },
+            "$or": [
+                {
+                    "execution_claimed_until": None,
+                },
+                {
+                    "execution_claimed_until": {
+                        "$lte": current_time,
+                    }
+                },
+                {
+                    "execution_claimed_until": {
+                        "$exists": False,
+                    }
+                },
+            ],
+        },
+        {
+            "$set": {
+                "execution_claimed_until": (
+                    claimed_until
+                ),
+                "updated_at": datetime.now(
+                    timezone.utc
+                ),
+            }
+        },
+    )
+
+    return result.modified_count == 1
+
+
+def complete_monitoring_check_schedule(
+    *,
+    check_id: str,
+    next_run_at: datetime,
+) -> bool:
+    """
+    Store the following run time and release the scheduler
+    claim after an execution attempt.
+    """
+    if not ObjectId.is_valid(check_id):
+        return False
+
+    if next_run_at.tzinfo is None:
+        raise ValueError(
+            "next_run_at must be timezone-aware."
+        )
+
+    database = get_database()
+
+    result = database[
+        "monitoring_checks"
+    ].update_one(
+        {
+            "_id": ObjectId(check_id),
+        },
+        {
+            "$set": {
+                "next_run_at": next_run_at,
+                "execution_claimed_until": None,
+                "updated_at": datetime.now(
+                    timezone.utc
+                ),
             }
         },
     )

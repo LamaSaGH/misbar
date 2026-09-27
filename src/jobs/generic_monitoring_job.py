@@ -2,6 +2,9 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
+from notifications.teams import (
+    notify_monitoring_check_result,
+)
 from services.generic_check_service import (
     run_generic_monitoring_check,
 )
@@ -22,8 +25,8 @@ def initialize_next_run_times(
     current_time: datetime,
 ) -> int:
     """
-    Assign next_run_at to active scheduled checks that do
-    not yet have an execution time.
+    Assign next_run_at to active scheduled checks that
+    do not yet have an execution time.
     """
     initialized_count = 0
 
@@ -55,10 +58,39 @@ def initialize_next_run_times(
     return initialized_count
 
 
+def _notify_safely(
+    *,
+    check: dict[str, Any],
+    status: str,
+    result: dict[str, Any],
+    run_id: str | None,
+) -> None:
+    """
+    Send a Teams alert without allowing a notification
+    failure to interrupt monitoring or scheduling.
+    """
+    try:
+        notify_monitoring_check_result(
+            check_name=check["name"],
+            platform=check["group"],
+            status=status,
+            result=result,
+            run_id=run_id,
+        )
+
+    except Exception as error:
+        print(
+            "Teams notification failed for "
+            f'{check["_id"]}: '
+            f"{type(error).__name__}: {error}"
+        )
+
+
 def run_due_monitoring_checks() -> dict[str, Any]:
     """
-    Initialize new schedules, execute all due checks, and
-    calculate their following execution times.
+    Initialize new schedules, execute all due checks,
+    notify Teams when needed, and calculate the next
+    execution times.
     """
     current_time = datetime.now(timezone.utc)
 
@@ -99,23 +131,50 @@ def run_due_monitoring_checks() -> dict[str, Any]:
             )
 
             execution_status = execution["status"]
+            run_id = execution.get("run_id")
+            execution_result = (
+                execution.get("result") or {}
+            )
 
             if execution_status == "passed":
                 passed_count += 1
-            else:
+
+            elif execution_status == "failed":
                 failed_count += 1
+
+            else:
+                error_count += 1
 
             executions.append(
                 {
                     "monitoring_check_id": check_id,
                     "name": check["name"],
                     "status": execution_status,
-                    "run_id": execution.get("run_id"),
+                    "run_id": run_id,
                 }
+            )
+
+            _notify_safely(
+                check=check,
+                status=execution_status,
+                result=execution_result,
+                run_id=run_id,
             )
 
         except Exception as error:
             error_count += 1
+
+            error_message = (
+                f"{type(error).__name__}: {error}"
+            )
+
+            error_result = {
+                "response": None,
+                "validation": {
+                    "passed": False,
+                    "message": error_message,
+                },
+            }
 
             executions.append(
                 {
@@ -123,16 +182,20 @@ def run_due_monitoring_checks() -> dict[str, Any]:
                     "name": check["name"],
                     "status": "error",
                     "run_id": None,
-                    "error": (
-                        f"{type(error).__name__}: "
-                        f"{error}"
-                    ),
+                    "error": error_message,
                 }
             )
 
             print(
                 f"Monitoring check {check_id} failed: "
-                f"{type(error).__name__}: {error}"
+                f"{error_message}"
+            )
+
+            _notify_safely(
+                check=check,
+                status="error",
+                result=error_result,
+                run_id=None,
             )
 
         finally:
@@ -167,9 +230,14 @@ def run_due_monitoring_checks() -> dict[str, Any]:
 
 def main() -> int:
     result = run_due_monitoring_checks()
+
     print(result)
 
-    return 1 if result["error_count"] > 0 else 0
+    return (
+        1
+        if result["error_count"] > 0
+        else 0
+    )
 
 
 if __name__ == "__main__":

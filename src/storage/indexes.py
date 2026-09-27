@@ -7,7 +7,9 @@ def ensure_database_indexes() -> None:
     database = get_database()
 
     database["check_runs"].create_index(
-        [("created_at", DESCENDING)]
+        [
+            ("created_at", DESCENDING),
+        ]
     )
 
     database["check_runs"].create_index(
@@ -17,38 +19,51 @@ def ensure_database_indexes() -> None:
         ]
     )
 
-    database["scan_runs"].create_index(
+    database["check_runs"].create_index(
         [
-            ("lexicon_id", ASCENDING),
-            ("started_at", DESCENDING),
+            ("monitoring_check_id", ASCENDING),
+            ("created_at", DESCENDING),
         ]
     )
 
-    database["lexicon_entries"].create_index(
+    database["check_runs"].create_index(
         [
-            ("lexicon_id", ASCENDING),
-            ("lexical_entry_id", ASCENDING),
-        ],
-        unique=True,
-    )
-
-    database["lexicon_entries"].create_index(
-        [
-            ("lexicon_id", ASCENDING),
-            ("is_active", ASCENDING),
+            ("group", ASCENDING),
+            ("created_at", DESCENDING),
         ]
     )
-    
-    database["scheduled_checks"].create_index(
+
+    database["check_runs"].create_index(
         [
             ("status", ASCENDING),
-            ("next_run_at", ASCENDING),
+            ("created_at", DESCENDING),
         ]
     )
 
-    database["scheduled_checks"].create_index(
+    database["monitoring_checks"].create_index(
         [
-            ("platform", ASCENDING),
-            ("check_type", ASCENDING),
+            ("status", ASCENDING),
+            ("created_at", DESCENDING),
+        ]
+    )
+
+    database["monitoring_checks"].create_index(
+        [
+            ("group", ASCENDING),
+            ("status", ASCENDING),
+        ]
+    )
+
+    database["monitoring_checks"].create_index(
+        [
+            ("tags", ASCENDING),
+        ]
+    )
+
+    database["monitoring_checks"].create_index(
+        [
+            ("status", ASCENDING),
+            ("schedule.enabled", ASCENDING),
+            ("next_run_at", ASCENDING),
         ]
     )

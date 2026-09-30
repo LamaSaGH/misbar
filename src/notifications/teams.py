@@ -8,8 +8,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+FAILED_STATUSES = {
+    "failed",
+    "error",
+}
+
+
 def is_teams_configured() -> bool:
-    return bool(os.getenv("TEAMS_WEBHOOK_URL"))
+    return bool(
+        os.getenv("TEAMS_WEBHOOK_URL")
+    )
 
 
 def send_teams_notification(
@@ -25,14 +33,18 @@ def send_teams_notification(
         "critical",
     }:
         raise ValueError(
-            "severity must be info, warning, or critical."
+            "severity must be info, warning, "
+            "or critical."
         )
 
-    webhook_url = os.getenv("TEAMS_WEBHOOK_URL")
+    webhook_url = os.getenv(
+        "TEAMS_WEBHOOK_URL"
+    )
 
     if not webhook_url:
         raise RuntimeError(
-            "TEAMS_WEBHOOK_URL is not configured."
+            "TEAMS_WEBHOOK_URL is not "
+            "configured."
         )
 
     payload = {
@@ -54,78 +66,21 @@ def send_teams_notification(
         "sent": True,
         "status_code": response.status_code,
     }
-    
-def notify_daily_scan_summary(
-    summary: dict[str, Any],
-) -> dict[str, Any]:
-    changed_scans = [
-        scan
-        for scan in summary["completed"]
-        if scan.get("changes_detected") is True
-    ]
 
-    failed_count = summary["failed_count"]
-    changed_count = len(changed_scans)
 
-    if failed_count == 0 and changed_count == 0:
-        return {
-            "sent": False,
-            "reason": "no_alert_needed",
-        }
-
-    if failed_count > 0:
-        title = "Sewar dictionary scan failure"
-        severity = "critical"
-        message = (
-            f"{failed_count} dictionary scan(s) failed. "
-            f"{changed_count} dictionary change(s) "
-            "were also detected."
-        )
-    else:
-        title = "Sewar dictionary changes detected"
-        severity = "warning"
-        message = (
-            f"Changes were detected in "
-            f"{changed_count} dictionary scan(s)."
-        )
-
-    return send_teams_notification(
-        title=title,
-        message=message,
-        severity=severity,
-        details={
-            "run_date": summary["run_date"],
-            "scheduled_count": summary[
-                "scheduled_count"
-            ],
-            "completed_count": summary[
-                "completed_count"
-            ],
-            "failed_count": failed_count,
-            "changed_count": changed_count,
-            "failed_scans": summary["failed"],
-            "changed_scans": changed_scans,
-        },
-    )
-    
-def notify_scheduled_check_result(
+def notify_monitoring_check_result(
     *,
-    schedule_name: str,
-    check_type: str,
+    check_name: str,
+    platform: str,
     status: str,
     result: dict[str, Any],
+    run_id: str | None = None,
 ) -> dict[str, Any]:
-    changes_detected = (
-        check_type == "dictionary_scan"
-        and result.get("changes_detected") is True
-    )
-
-    failed = status in {
-        "failed",
-        "error",
-    }
-
-    if not failed and not changes_detected:
+    """
+    Send a Teams notification when a generic
+    monitoring check fails or encounters an error.
+    """
+    if status not in FAILED_STATUSES:
         return {
             "sent": False,
             "reason": "no_alert_needed",
@@ -137,19 +92,23 @@ def notify_scheduled_check_result(
             "reason": "teams_not_configured",
         }
 
-    if failed:
-        title = "Sewar scheduled check failed"
+    if status == "error":
+        title = "Misbar monitoring connection error"
         severity = "critical"
         message = (
-            f'The scheduled check "{schedule_name}" '
-            f"finished with status: {status}."
+            f'The check "{check_name}" for '
+            f'"{platform}" could not complete '
+            "because of a connection or request "
+            "error."
         )
+
     else:
-        title = "Sewar dictionary changes detected"
+        title = "Misbar monitoring check failed"
         severity = "warning"
         message = (
-            f'The scheduled scan "{schedule_name}" '
-            "detected dictionary changes."
+            f'The check "{check_name}" for '
+            f'"{platform}" completed, but one or '
+            "more validation conditions failed."
         )
 
     return send_teams_notification(
@@ -157,9 +116,10 @@ def notify_scheduled_check_result(
         message=message,
         severity=severity,
         details={
-            "schedule_name": schedule_name,
-            "check_type": check_type,
+            "check_name": check_name,
+            "platform": platform,
             "status": status,
+            "run_id": run_id,
             "result": result,
         },
     )

@@ -2,257 +2,333 @@ from typing import Any
 
 from mcp.server import MCPServer
 
-from platforms.sewar.api_client import search_word
-from services.check_service import (
-    run_search_api_health_check,
-    run_website_uptime_check,
-    run_word_visibility_check,
+from services.generic_check_service import (
+    run_generic_monitoring_check,
 )
-from services.scan_service import run_lexicon_scan
-from services.schedule_service import run_scheduled_check
+from services.monitoring_check_management import (
+    MonitoringCheckDeletionConflictError,
+    MonitoringCheckNotFoundError,
+    delete_unused_monitoring_check,
+)
 from storage.check_runs import list_check_runs
-from storage.scheduled_checks import (
-    create_scheduled_check,
-    get_scheduled_check,
-    list_scheduled_checks,
-    set_scheduled_check_status,
+from storage.monitoring_checks import (
+    create_monitoring_check,
+    get_monitoring_check,
+    list_monitoring_checks,
+    set_monitoring_check_status,
 )
 
 
-mcp = MCPServer("Sewar Monitor")
+mcp = MCPServer("Misbar")
 
 
 @mcp.tool()
-def verify_word_visibility(
-    word: str,
-    expected_visible: bool,
-    expected_dictionary: str | None = None,
+def create_api_check(
+    name: str,
+    platform: str,
+    request_url: str,
+    request_method: str = "GET",
+    validations: list[dict[str, Any]] | None = None,
+    validation_logic: str = "all",
+    tags: list[str] | None = None,
+    request_headers: dict[str, str] | None = None,
+    query_parameters: dict[str, Any] | None = None,
+    request_body: Any = None,
+    timeout_seconds: int = 15,
+    schedule_enabled: bool = False,
+    frequency: str | None = None,
+    run_time: str | None = None,
+    timezone_name: str = "Asia/Riyadh",
 ) -> dict[str, Any]:
-    """Verify whether a word has the expected public visibility."""
-    return run_word_visibility_check(
-        word=word,
-        expected_visible=expected_visible,
-        expected_dictionary=expected_dictionary,
+    """
+    Create and save a reusable API monitoring check.
+
+    Validation rule examples:
+
+    Status code equals 200:
+    {
+        "source": "status_code",
+        "operator": "equals",
+        "expected": 200
+    }
+
+    JSON field is not empty:
+    {
+        "source": "json",
+        "path": "entries",
+        "operator": "is_not_empty"
+    }
+
+    Response time is below 1000 milliseconds:
+    {
+        "source": "response_time_ms",
+        "operator": "less_than",
+        "expected": 1000
+    }
+
+    Supported validation_logic values:
+    all, any.
+
+    Supported schedule frequencies:
+    daily, weekly, monthly.
+    """
+    configured_validations = validations or [
+        {
+            "source": "status_code",
+            "operator": "equals",
+            "expected": 200,
+        }
+    ]
+
+    check_id = create_monitoring_check(
+        name=name,
+        group=platform,
+        request_url=request_url,
+        request_method=request_method,
+        function_name=None,
+        function_parameters={},
+        validations=configured_validations,
+        validation_logic=validation_logic,
+        tags=tags,
+        request_headers=request_headers,
+        query_parameters=query_parameters,
+        request_body=request_body,
+        timeout_seconds=timeout_seconds,
+        schedule_enabled=schedule_enabled,
+        frequency=frequency,
+        run_time=run_time,
+        timezone_name=timezone_name,
+    )
+
+    check = get_monitoring_check(check_id)
+
+    if check is None:
+        raise RuntimeError(
+            "The monitoring check was created but "
+            "could not be retrieved."
+        )
+
+    return check
+
+
+@mcp.tool()
+def list_api_checks(
+    platform: str | None = None,
+    status: str | None = None,
+    tag: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """
+    List saved monitoring checks.
+
+    status may be:
+    active, paused, or archived.
+    """
+    return list_monitoring_checks(
+        limit=limit,
+        group=platform,
+        status=status,
+        tag=tag,
+    )
+
+
+@mcp.tool()
+def get_api_check(
+    check_id: str,
+) -> dict[str, Any]:
+    """Return the complete configuration of one check."""
+    check = get_monitoring_check(check_id)
+
+    if check is None:
+        raise ValueError(
+            "Monitoring check not found."
+        )
+
+    return check
+
+
+@mcp.tool()
+def run_api_check(
+    check_id: str,
+) -> dict[str, Any]:
+    """
+    Run a saved active monitoring check immediately.
+
+    The result includes the status, response metadata,
+    response time, and validation results.
+    """
+    return run_generic_monitoring_check(
+        check_id,
         source="mcp",
     )
 
 
 @mcp.tool()
-def lookup_word_details(
-    word: str,
-    max_entries: int = 10,
+def get_recent_api_check_runs(
+    limit: int = 20,
+    platform: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Return recent generic API monitoring results.
+
+    status may be:
+    passed, failed, or error.
+    """
+    if limit < 1 or limit > 200:
+        raise ValueError(
+            "limit must be between 1 and 200."
+        )
+
+    if status not in {
+        None,
+        "passed",
+        "failed",
+        "error",
+    }:
+        raise ValueError(
+            "status must be passed, failed, or error."
+        )
+
+    runs = list_check_runs(
+        limit=200,
+        check_type="generic_api",
+    )
+
+    filtered_runs = []
+
+    for run in runs:
+        run_platform = (
+            run.get("group")
+            or run.get("platform")
+        )
+
+        if (
+            platform is not None
+            and run_platform != platform
+        ):
+            continue
+
+        if (
+            status is not None
+            and run.get("status") != status
+        ):
+            continue
+
+        filtered_runs.append(run)
+
+        if len(filtered_runs) >= limit:
+            break
+
+    return filtered_runs
+
+
+@mcp.tool()
+def pause_api_check(
+    check_id: str,
+) -> dict[str, Any]:
+    """Pause a monitoring check."""
+    return _change_check_status(
+        check_id=check_id,
+        status="paused",
+    )
+
+
+@mcp.tool()
+def resume_api_check(
+    check_id: str,
+) -> dict[str, Any]:
+    """Reactivate a paused or archived monitoring check."""
+    return _change_check_status(
+        check_id=check_id,
+        status="active",
+    )
+
+
+@mcp.tool()
+def archive_api_check(
+    check_id: str,
 ) -> dict[str, Any]:
     """
-    Return definitions, roots, examples, translations, and
-    dictionary information for a word from Sewar's live API.
+    Archive a monitoring check while preserving its
+    execution history.
     """
-    normalized_word = word.strip()
+    return _change_check_status(
+        check_id=check_id,
+        status="archived",
+    )
 
-    if not normalized_word:
-        raise ValueError("word must not be empty.")
 
-    if max_entries < 1 or max_entries > 50:
-        raise ValueError(
-            "max_entries must be between 1 and 50."
-        )
+@mcp.tool()
+def delete_api_check(
+    check_id: str,
+) -> dict[str, Any]:
+    """
+    Permanently delete an unused archived check.
 
-    response = search_word(normalized_word)
-    entries = response.get("entries") or []
+    Checks with execution history cannot be permanently
+    deleted because their monitoring records must remain
+    available.
+    """
+    try:
+        delete_unused_monitoring_check(check_id)
 
-    results = []
+    except MonitoringCheckNotFoundError as error:
+        raise ValueError(str(error)) from error
 
-    for entry in entries[:max_entries]:
-        senses = []
-
-        for sense in entry.get("senses") or []:
-            synset = sense.get("synset") or {}
-
-            senses.append(
-                {
-                    "definition": sense.get("definition"),
-                    "contexts": sense.get("contexts") or [],
-                    "examples": sense.get("examples") or [],
-                    "translations": (
-                        sense.get("translations") or []
-                    ),
-                    "relations": sense.get("relations") or [],
-                    "domains": sense.get("domains") or [],
-                    "synset": {
-                        "name": synset.get("name"),
-                        "description": synset.get(
-                            "description"
-                        ),
-                        "code": synset.get("code"),
-                    },
-                }
-            )
-
-        results.append(
-            {
-                "lexical_entry_id": entry.get(
-                    "lexicalEntryId"
-                ),
-                "lexicon_id": entry.get("lexiconId"),
-                "lexicon_name": entry.get("lexiconName"),
-                "lemma": entry.get("lemma"),
-                "non_diacritics_lemma": entry.get(
-                    "nonDiacriticsLemma"
-                ),
-                "lemma_type": entry.get("lemmaType"),
-                "root": entry.get("root"),
-                "part_of_speech": entry.get("pos"),
-                "pattern": entry.get("pattern"),
-                "senses": senses,
-                "word_forms": entry.get("wordForms") or [],
-                "entry_relations": (
-                    entry.get("entryRelations") or []
-                ),
-            }
-        )
+    except (
+        MonitoringCheckDeletionConflictError
+    ) as error:
+        raise ValueError(str(error)) from error
 
     return {
-        "word": normalized_word,
-        "matching_entries_count": len(entries),
-        "returned_count": len(results),
-        "entries": results,
+        "deleted": True,
+        "check_id": check_id,
     }
 
 
 @mcp.tool()
-def check_website_uptime() -> dict[str, Any]:
-    """Check whether the public Sewar website is reachable."""
-    return run_website_uptime_check(source="mcp")
-
-
-@mcp.tool()
-def check_search_api_health(
-    probe_word: str = "سلام",
-) -> dict[str, Any]:
-    """Check Sewar's public search API and response structure."""
-    return run_search_api_health_check(
-        probe_word=probe_word,
-        source="mcp",
-    )
-
-
-@mcp.tool()
-def get_recent_checks(
-    limit: int = 20,
-    check_type: str | None = None,
+def list_scheduled_api_checks(
+    platform: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """Return recent monitoring results from MongoDB."""
-    return list_check_runs(
+    """Return monitoring checks with scheduling enabled."""
+    checks = list_monitoring_checks(
         limit=limit,
-        check_type=check_type,
+        group=platform,
+        status=status,
     )
 
+    return [
+        check
+        for check in checks
+        if (
+            check.get("schedule") or {}
+        ).get("enabled") is True
+    ]
 
-@mcp.tool()
-def scan_dictionary(
-    lexicon_id: str,
-    lexicon_name: str,
+
+def _change_check_status(
+    *,
+    check_id: str,
+    status: str,
 ) -> dict[str, Any]:
-    """Scan one Sewar dictionary and detect entry changes."""
-    return run_lexicon_scan(
-        lexicon_id=lexicon_id,
-        lexicon_name=lexicon_name,
-        source="mcp",
+    updated = set_monitoring_check_status(
+        check_id=check_id,
+        status=status,
     )
 
-
-@mcp.tool()
-def create_monitoring_schedule(
-    name: str,
-    check_type: str,
-    frequency: str,
-    run_time: str,
-    parameters: dict[str, Any] | None = None,
-    timezone_name: str = "Asia/Riyadh",
-) -> dict[str, Any]:
-    """
-    Create a recurring Sewar monitoring schedule.
-
-    Supported check types:
-    website_uptime, search_api_health,
-    word_visibility, dictionary_scan.
-
-    Supported frequencies:
-    daily, weekly, monthly.
-
-    run_time must use the 24-hour HH:MM format.
-    """
-    schedule_id = create_scheduled_check(
-        name=name,
-        check_type=check_type,
-        frequency=frequency,
-        run_time=run_time,
-        parameters=parameters,
-        timezone_name=timezone_name,
-    )
-
-    schedule = get_scheduled_check(schedule_id)
-
-    if schedule is None:
-        raise RuntimeError(
-            "The schedule was created but could not be retrieved."
+    if not updated:
+        raise ValueError(
+            "Monitoring check not found."
         )
 
-    return schedule
+    check = get_monitoring_check(check_id)
 
+    if check is None:
+        raise ValueError(
+            "Monitoring check not found."
+        )
 
-@mcp.tool()
-def get_monitoring_schedules(
-    status: str | None = None,
-) -> list[dict[str, Any]]:
-    """List active, paused, or all monitoring schedules."""
-    return list_scheduled_checks(status=status)
-
-
-@mcp.tool()
-def pause_monitoring_schedule(
-    schedule_id: str,
-) -> dict[str, Any]:
-    """Pause an existing monitoring schedule."""
-    updated = set_scheduled_check_status(
-        schedule_id=schedule_id,
-        status="paused",
-    )
-
-    if not updated:
-        raise ValueError("Scheduled check not found.")
-
-    schedule = get_scheduled_check(schedule_id)
-
-    if schedule is None:
-        raise ValueError("Scheduled check not found.")
-
-    return schedule
-
-
-@mcp.tool()
-def resume_monitoring_schedule(
-    schedule_id: str,
-) -> dict[str, Any]:
-    """Resume a paused monitoring schedule."""
-    updated = set_scheduled_check_status(
-        schedule_id=schedule_id,
-        status="active",
-    )
-
-    if not updated:
-        raise ValueError("Scheduled check not found.")
-
-    schedule = get_scheduled_check(schedule_id)
-
-    if schedule is None:
-        raise ValueError("Scheduled check not found.")
-
-    return schedule
-
-
-@mcp.tool()
-def run_monitoring_schedule_now(
-    schedule_id: str,
-) -> dict[str, Any]:
-    """Run an existing monitoring schedule immediately."""
-    return run_scheduled_check(schedule_id)
+    return check

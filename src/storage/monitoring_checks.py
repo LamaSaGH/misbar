@@ -9,14 +9,11 @@ from validation.rule_engine import (
 )
 from check_functions.registry import get_check_function
 from storage.mongodb import get_database
-
+from services.schedule_time import calculate_next_run_at
 
 ALLOWED_METHODS = {
     "GET",
     "POST",
-    "PUT",
-    "PATCH",
-    "DELETE",
     "HEAD",
 }
 
@@ -189,6 +186,16 @@ def create_monitoring_check(
 
     now = datetime.now(timezone.utc)
 
+    next_run_at = None
+
+    if schedule_enabled:
+        next_run_at = calculate_next_run_at(
+            frequency=frequency,
+            run_time=run_time,
+            timezone_name=normalized_timezone_name,
+            from_time=now,
+        )
+
     document = {
         "name": normalized_name,
         "group": normalized_group,
@@ -221,7 +228,7 @@ def create_monitoring_check(
         "last_run_at": None,
         "last_run_status": None,
         "last_run_id": None,
-        "next_run_at": None,
+        "next_run_at": next_run_at,
         "execution_claimed_until": None,
         "created_at": now,
         "updated_at": now,
@@ -256,6 +263,150 @@ def get_monitoring_check(
         return None
 
     return _serialize_document(document)
+
+
+def update_monitoring_check(
+    *,
+    check_id: str,
+    name: str,
+    group: str,
+    request_url: str,
+    request_method: str,
+    function_name: str | None = None,
+    tags: list[str] | None = None,
+    request_headers: dict[str, str] | None = None,
+    query_parameters: dict[str, Any] | None = None,
+    request_body: Any = None,
+    timeout_seconds: int = 15,
+    function_parameters: dict[str, Any] | None = None,
+    validations: list[dict[str, Any]] | None = None,
+    validation_logic: str = "all",
+    schedule_enabled: bool = False,
+    frequency: str | None = None,
+    run_time: str | None = None,
+    timezone_name: str = "Asia/Riyadh",
+) -> bool:
+    if not ObjectId.is_valid(check_id):
+        return False
+
+    normalized_name = name.strip()
+    normalized_group = group.strip()
+    normalized_method = request_method.strip().upper()
+    normalized_timezone_name = timezone_name.strip()
+
+    if not normalized_name:
+        raise ValueError("name must not be empty.")
+
+    if not normalized_group:
+        raise ValueError("group must not be empty.")
+
+    if normalized_method not in ALLOWED_METHODS:
+        raise ValueError(
+            f"Unsupported request method: {normalized_method}"
+        )
+
+    normalized_url = _validate_request_url(request_url)
+
+    if timeout_seconds < 1 or timeout_seconds > 120:
+        raise ValueError(
+            "timeout_seconds must be between 1 and 120."
+        )
+
+    configured_validations = validations or []
+
+    if configured_validations:
+        validation_mode = "rules"
+        validate_validation_rules(
+            validations=configured_validations,
+            validation_logic=validation_logic,
+        )
+        normalized_function_name = None
+        normalized_function_parameters = {}
+    else:
+        validation_mode = "function"
+
+        if function_name is None or not function_name.strip():
+            raise ValueError(
+                "A function name or validation rules are required."
+            )
+
+        normalized_function_name = function_name.strip()
+        get_check_function(normalized_function_name)
+        normalized_function_parameters = function_parameters or {}
+
+    if schedule_enabled:
+        if frequency not in ALLOWED_FREQUENCIES:
+            raise ValueError(
+                "Scheduled checks require a supported frequency."
+            )
+
+        if (
+            run_time is None
+            or RUN_TIME_PATTERN.fullmatch(run_time) is None
+        ):
+            raise ValueError(
+                "Scheduled checks require run_time in HH:MM format."
+            )
+
+        if not normalized_timezone_name:
+            raise ValueError("timezone_name must not be empty.")
+    else:
+        frequency = None
+        run_time = None
+
+    database = get_database()
+    existing = database["monitoring_checks"].find_one(
+        {"_id": ObjectId(check_id)}
+    )
+
+    if existing is None:
+        return False
+
+    now = datetime.now(timezone.utc)
+    next_run_at = None
+
+    if schedule_enabled and existing.get("status") == "active":
+        next_run_at = calculate_next_run_at(
+            frequency=frequency,
+            run_time=run_time,
+            timezone_name=normalized_timezone_name,
+            from_time=now,
+        )
+
+    result = database["monitoring_checks"].update_one(
+        {"_id": ObjectId(check_id)},
+        {
+            "$set": {
+                "name": normalized_name,
+                "group": normalized_group,
+                "tags": _normalize_tags(tags),
+                "request": {
+                    "method": normalized_method,
+                    "url": normalized_url,
+                    "headers": request_headers or {},
+                    "query_parameters": query_parameters or {},
+                    "body": request_body,
+                    "timeout_seconds": timeout_seconds,
+                },
+                "validation_mode": validation_mode,
+                "validations": configured_validations,
+                "validation_logic": validation_logic,
+                "function_name": normalized_function_name,
+                "function_parameters": normalized_function_parameters,
+                "schedule": {
+                    "enabled": schedule_enabled,
+                    "frequency": frequency,
+                    "run_time": run_time,
+                    "timezone": normalized_timezone_name,
+                },
+                "next_run_at": next_run_at,
+                "execution_claimed_until": None,
+                "updated_at": now,
+            }
+        },
+    )
+
+    return result.matched_count == 1
 
 
 def list_monitoring_checks(
@@ -317,20 +468,51 @@ def set_monitoring_check_status(
     if not ObjectId.is_valid(check_id):
         return False
 
+    database = get_database()
+
+    check = database[
+        "monitoring_checks"
+    ].find_one(
+        {
+            "_id": ObjectId(check_id),
+        }
+    )
+
+    if check is None:
+        return False
+
     now = datetime.now(timezone.utc)
 
     fields_to_set: dict[str, Any] = {
         "status": status,
         "updated_at": now,
+        "execution_claimed_until": None,
     }
 
-    if status in {"paused", "archived"}:
-        fields_to_set["next_run_at"] = None
-        fields_to_set[
-            "execution_claimed_until"
-        ] = None
+    if status == "active":
+        schedule = check.get("schedule") or {}
 
-    database = get_database()
+        if schedule.get("enabled") is True:
+            fields_to_set["next_run_at"] = (
+                calculate_next_run_at(
+                    frequency=schedule.get(
+                        "frequency"
+                    ),
+                    run_time=schedule.get(
+                        "run_time"
+                    ),
+                    timezone_name=schedule.get(
+                        "timezone",
+                        "Asia/Riyadh",
+                    ),
+                    from_time=now,
+                )
+            )
+        else:
+            fields_to_set["next_run_at"] = None
+
+    else:
+        fields_to_set["next_run_at"] = None
 
     result = database[
         "monitoring_checks"
@@ -627,6 +809,26 @@ def delete_archived_monitoring_check(
             "last_run_at": None,
             "last_run_id": None,
         }
+    )
+
+    return result.deleted_count == 1
+
+
+def delete_monitoring_check(
+    check_id: str,
+) -> bool:
+    """
+    Delete the saved check configuration.
+
+    Existing execution history remains in check_runs because
+    every run stores its own request and result snapshot.
+    """
+    if not ObjectId.is_valid(check_id):
+        return False
+
+    database = get_database()
+    result = database["monitoring_checks"].delete_one(
+        {"_id": ObjectId(check_id)}
     )
 
     return result.deleted_count == 1

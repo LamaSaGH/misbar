@@ -19,7 +19,7 @@ from storage.monitoring_checks import (
 )
 
 
-mcp = MCPServer("Misbar Monitoring")
+mcp = MCPServer("Misbar")
 
 
 @mcp.tool()

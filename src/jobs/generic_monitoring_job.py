@@ -112,11 +112,11 @@ def run_due_monitoring_checks() -> dict[str, Any]:
 
     for check in due_checks:
         check_id = check["_id"]
+        claim_time = datetime.now(timezone.utc)
 
         claimed = claim_due_monitoring_check(
             check_id=check_id,
-            current_time=current_time,
-        )
+            current_time=claim_time,)
 
         if not claimed:
             skipped_count += 1
